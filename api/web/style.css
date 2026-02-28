@@ -1,0 +1,43 @@
+/* Amp Sentinel Dashboard — Blue & White */
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #f1f5f9; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+.page { display: none; }
+.page.active { display: block; }
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 4px;
+}
+
+.modal-backdrop {
+  background: rgba(15, 23, 42, 0.4);
+  backdrop-filter: blur(4px);
+}
+
+@keyframes slide-in { from { opacity: 0; transform: translateX(100%); } to { opacity: 1; transform: translateX(0); } }
+.animate-slide-in { animation: slide-in 0.3s ease-out; transition: opacity 0.3s, transform 0.3s; }
+
+@keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+.task-pulse { animation: pulse-dot 1.5s ease-in-out infinite; }
+
+.report-content h1 { font-size: 1.5rem; font-weight: 700; margin: 1rem 0 0.5rem; color: #1e293b; }
+.report-content h2 { font-size: 1.25rem; font-weight: 600; margin: 1rem 0 0.5rem; color: #1e293b; }
+.report-content h3 { font-size: 1.1rem; font-weight: 600; margin: 0.75rem 0 0.25rem; color: #334155; }
+.report-content p { margin: 0.5rem 0; }
+.report-content ul, .report-content ol { margin: 0.5rem 0; padding-left: 1.5rem; }
+.report-content li { margin: 0.25rem 0; list-style: disc; }
+.report-content code { background: #f1f5f9; color: #2563eb; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.875rem; }
+.report-content pre { background: #1e293b; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow-x: auto; margin: 0.75rem 0; }
+.report-content pre code { background: none; color: inherit; padding: 0; }
+.report-content strong { color: #1e293b; }
+.report-content blockquote { border-left: 3px solid #3b82f6; padding-left: 1rem; color: #64748b; margin: 0.5rem 0; }

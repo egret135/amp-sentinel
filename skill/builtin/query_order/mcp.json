@@ -1,0 +1,10 @@
+{
+  "order_query_server": {
+    "command": "node",
+    "args": ["skills/query_order/server.js"],
+    "env": {
+      "ORDER_API_BASE": "${ORDER_API_BASE}",
+      "ORDER_API_TOKEN": "${ORDER_API_TOKEN}"
+    }
+  }
+}

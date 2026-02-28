@@ -1,0 +1,23 @@
+# Binary
+amp-sentinel
+
+# Data & repos
+data/
+
+# Logs
+logs/
+
+# Skills (runtime)
+skills/
+
+# Config (contains secrets)
+config.yaml
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

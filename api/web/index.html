@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Amp Sentinel</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+
+<!-- Login -->
+<div id="login-screen" class="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 via-white to-blue-100">
+    <div class="bg-white rounded-2xl p-8 w-full max-w-md shadow-lg border border-blue-100">
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-blue-600">⚡ Amp Sentinel</h1>
+            <p class="text-slate-400 mt-2">线上故障自动诊断平台</p>
+        </div>
+        <div class="space-y-4">
+            <div>
+                <label class="block text-sm text-slate-500 mb-1">Admin API Token</label>
+                <input type="password" id="login-token" placeholder="输入管理 API Token"
+                    class="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-3 text-slate-800 placeholder-slate-400 focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all">
+            </div>
+            <div id="login-error" class="text-red-500 text-sm hidden"></div>
+            <button id="login-btn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 rounded-lg transition-colors shadow-sm shadow-blue-200">登 录</button>
+            <p class="text-xs text-slate-400 text-center">Token 仅存储在浏览器本地</p>
+        </div>
+    </div>
+</div>
+
+<!-- App -->
+<div id="app" class="hidden min-h-screen flex">
+    <!-- Sidebar -->
+    <aside class="w-56 bg-white border-r border-slate-200 flex flex-col fixed h-full z-10 shadow-sm">
+        <div class="p-4 border-b border-slate-200">
+            <h1 class="text-lg font-bold text-blue-600">⚡ Amp Sentinel</h1>
+            <div id="health-status" class="text-xs text-slate-400 mt-1">检查连接中...</div>
+        </div>
+        <nav class="flex-1 p-3 space-y-1">
+            <a href="#dashboard" class="nav-link flex items-center px-3 py-2 rounded-lg text-slate-500 hover:bg-blue-50 hover:text-blue-600 transition-colors" data-page="dashboard">
+                <span class="mr-3">📊</span>仪表盘</a>
+            <a href="#incidents" class="nav-link flex items-center px-3 py-2 rounded-lg text-slate-500 hover:bg-blue-50 hover:text-blue-600 transition-colors" data-page="incidents">
+                <span class="mr-3">🔔</span>故障事件</a>
+            <a href="#tasks" class="nav-link flex items-center px-3 py-2 rounded-lg text-slate-500 hover:bg-blue-50 hover:text-blue-600 transition-colors" data-page="tasks">
+                <span class="mr-3">📋</span>诊断任务</a>
+            <a href="#projects" class="nav-link flex items-center px-3 py-2 rounded-lg text-slate-500 hover:bg-blue-50 hover:text-blue-600 transition-colors" data-page="projects">
+                <span class="mr-3">⚙️</span>项目管理</a>
+        </nav>
+        <div class="p-3 border-t border-slate-200">
+            <button id="logout-btn" class="w-full flex items-center px-3 py-2 rounded-lg text-slate-400 hover:bg-red-50 hover:text-red-500 transition-colors text-sm">
+                <span class="mr-3">🚪</span>退出登录</button>
+        </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="flex-1 ml-56 p-6">
+
+        <!-- Dashboard -->
+        <div id="page-dashboard" class="page">
+            <h2 class="text-2xl font-bold mb-6 text-slate-800">仪表盘</h2>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm">
+                    <div class="text-slate-400 text-sm">故障事件</div>
+                    <div class="text-3xl font-bold mt-1 text-slate-800" id="stat-total-incidents">-</div>
+                    <div class="text-sm text-slate-400 mt-1">今日 <span id="stat-today-incidents" class="text-blue-600 font-medium">-</span></div>
+                </div>
+                <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm">
+                    <div class="text-slate-400 text-sm">运行中任务</div>
+                    <div class="text-3xl font-bold mt-1 text-amber-500" id="stat-running">-</div>
+                    <div class="text-sm text-slate-400 mt-1">队列 <span id="stat-queue" class="text-orange-500 font-medium">-</span></div>
+                </div>
+                <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm">
+                    <div class="text-slate-400 text-sm">已完成</div>
+                    <div class="text-3xl font-bold mt-1 text-emerald-500" id="stat-completed">-</div>
+                    <div class="text-sm text-slate-400 mt-1">成功率 <span id="stat-success-rate" class="text-emerald-500 font-medium">-</span></div>
+                </div>
+                <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm">
+                    <div class="text-slate-400 text-sm">失败</div>
+                    <div class="text-3xl font-bold mt-1 text-red-500" id="stat-failed">-</div>
+                    <div class="text-sm text-slate-400 mt-1">超时 <span id="stat-timeout" class="text-orange-500 font-medium">-</span></div>
+                </div>
+            </div>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+                <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm">
+                    <h3 class="text-sm font-medium text-slate-500 mb-4">任务状态分布</h3>
+                    <div class="h-64 flex items-center justify-center"><canvas id="chart-status"></canvas></div>
+                </div>
+                <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm">
+                    <h3 class="text-sm font-medium text-slate-500 mb-4">Token 消耗</h3>
+                    <div class="h-64 flex items-center justify-center"><canvas id="chart-tokens"></canvas></div>
+                </div>
+            </div>
+            <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm">
+                <h3 class="text-sm font-medium text-slate-500 mb-4">最近故障事件</h3>
+                <div id="recent-incidents" class="space-y-2"><div class="text-slate-400 text-sm">加载中...</div></div>
+            </div>
+        </div>
+
+        <!-- Incidents -->
+        <div id="page-incidents" class="page">
+            <div class="flex items-center justify-between mb-6">
+                <h2 class="text-2xl font-bold text-slate-800">故障事件</h2>
+                <div class="flex gap-2">
+                    <select id="filter-inc-project" class="bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-600 focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"><option value="">全部项目</option></select>
+                    <select id="filter-inc-severity" class="bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-600 focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+                        <option value="">全部严重度</option><option value="critical">Critical</option><option value="warning">Warning</option><option value="info">Info</option>
+                    </select>
+                </div>
+            </div>
+            <div class="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+                <table class="w-full">
+                    <thead><tr class="text-left text-xs text-slate-400 uppercase tracking-wider bg-slate-50">
+                        <th class="px-4 py-3">ID</th><th class="px-4 py-3">标题</th><th class="px-4 py-3">项目</th>
+                        <th class="px-4 py-3">严重度</th><th class="px-4 py-3">来源</th><th class="px-4 py-3">发生时间</th><th class="px-4 py-3">操作</th>
+                    </tr></thead>
+                    <tbody id="incidents-tbody" class="divide-y divide-slate-100">
+                        <tr><td colspan="7" class="px-4 py-8 text-center text-slate-400">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div id="incidents-pagination" class="flex items-center justify-between mt-4 text-sm text-slate-500"></div>
+        </div>
+
+        <!-- Tasks -->
+        <div id="page-tasks" class="page">
+            <div class="flex items-center justify-between mb-6">
+                <h2 class="text-2xl font-bold text-slate-800">诊断任务</h2>
+                <div class="flex gap-2">
+                    <select id="filter-task-project" class="bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-600 focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"><option value="">全部项目</option></select>
+                    <select id="filter-task-status" class="bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-600 focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+                        <option value="">全部状态</option><option value="pending">Pending</option><option value="running">Running</option>
+                        <option value="completed">Completed</option><option value="failed">Failed</option><option value="timeout">Timeout</option>
+                    </select>
+                </div>
+            </div>
+            <div class="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+                <table class="w-full">
+                    <thead><tr class="text-left text-xs text-slate-400 uppercase tracking-wider bg-slate-50">
+                        <th class="px-4 py-3">ID</th><th class="px-4 py-3">事件 ID</th><th class="px-4 py-3">项目</th>
+                        <th class="px-4 py-3">状态</th><th class="px-4 py-3">耗时</th><th class="px-4 py-3">Token</th>
+                        <th class="px-4 py-3">创建时间</th><th class="px-4 py-3">操作</th>
+                    </tr></thead>
+                    <tbody id="tasks-tbody" class="divide-y divide-slate-100">
+                        <tr><td colspan="8" class="px-4 py-8 text-center text-slate-400">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div id="tasks-pagination" class="flex items-center justify-between mt-4 text-sm text-slate-500"></div>
+        </div>
+
+        <!-- Projects -->
+        <div id="page-projects" class="page">
+            <h2 class="text-2xl font-bold mb-6 text-slate-800">项目管理</h2>
+            <div id="projects-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div class="text-slate-400">加载中...</div>
+            </div>
+        </div>
+
+    </main>
+</div>
+
+<!-- Incident Detail Modal -->
+<div id="modal-incident" class="fixed inset-0 z-50 hidden">
+    <div class="modal-backdrop absolute inset-0" onclick="closeModal('modal-incident')"></div>
+    <div class="relative z-10 flex items-center justify-center min-h-screen p-4">
+        <div class="bg-white rounded-2xl border border-slate-200 w-full max-w-3xl max-h-[85vh] overflow-y-auto shadow-xl">
+            <div class="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between rounded-t-2xl">
+                <h3 class="text-lg font-bold text-slate-800">故障事件详情</h3>
+                <button onclick="closeModal('modal-incident')" class="text-slate-400 hover:text-slate-600 text-2xl leading-none">&times;</button>
+            </div>
+            <div id="modal-incident-content" class="p-6"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Task Detail Modal -->
+<div id="modal-task" class="fixed inset-0 z-50 hidden">
+    <div class="modal-backdrop absolute inset-0" onclick="closeModal('modal-task')"></div>
+    <div class="relative z-10 flex items-center justify-center min-h-screen p-4">
+        <div class="bg-white rounded-2xl border border-slate-200 w-full max-w-4xl max-h-[85vh] overflow-y-auto shadow-xl">
+            <div class="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between rounded-t-2xl">
+                <h3 class="text-lg font-bold text-slate-800">诊断任务详情</h3>
+                <button onclick="closeModal('modal-task')" class="text-slate-400 hover:text-slate-600 text-2xl leading-none">&times;</button>
+            </div>
+            <div id="modal-task-content" class="p-6"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Report Fullscreen Modal -->
+<div id="modal-report" class="fixed inset-0 z-50 hidden">
+    <div class="absolute inset-0 bg-white flex flex-col">
+        <div class="border-b border-slate-200 px-6 py-3 flex items-center justify-between flex-shrink-0">
+            <h3 class="text-lg font-bold text-slate-800">📋 诊断报告</h3>
+            <button onclick="closeModal('modal-report')" class="text-slate-400 hover:text-slate-600 text-sm px-3 py-1 rounded-lg border border-slate-200 hover:bg-slate-50 transition-colors">ESC 退出全屏</button>
+        </div>
+        <div id="modal-report-content" class="flex-1 overflow-y-auto p-6 report-content text-sm text-slate-600 leading-relaxed"></div>
+    </div>
+</div>
+
+<!-- Toast Container -->
+<div id="toast-container" class="fixed top-4 right-4 z-[60] space-y-2"></div>
+
+<!-- Confirm Dialog -->
+<div id="modal-confirm" class="fixed inset-0 z-[55] hidden">
+    <div class="modal-backdrop absolute inset-0"></div>
+    <div class="relative z-10 flex items-center justify-center min-h-screen p-4">
+        <div class="bg-white rounded-2xl border border-slate-200 w-full max-w-sm shadow-xl p-6">
+            <div class="text-center">
+                <div class="text-4xl mb-3" id="confirm-icon">⚠️</div>
+                <h3 class="text-lg font-bold text-slate-800 mb-2" id="confirm-title">确认操作</h3>
+                <p class="text-sm text-slate-500 mb-6" id="confirm-msg"></p>
+            </div>
+            <div class="flex gap-3">
+                <button id="confirm-cancel" class="flex-1 px-4 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors text-sm">取消</button>
+                <button id="confirm-ok" class="flex-1 px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors text-sm shadow-sm">确定</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

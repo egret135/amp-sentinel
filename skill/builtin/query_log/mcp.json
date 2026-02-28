@@ -1,0 +1,8 @@
+{
+  "log_query_server": {
+    "url": "${LOG_MCP_SERVER_URL}",
+    "headers": {
+      "Authorization": "Bearer ${LOG_MCP_TOKEN}"
+    }
+  }
+}
