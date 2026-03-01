@@ -150,6 +150,8 @@ EOF
 
 ## 诊断流水线
 
+> 📖 完整流程详见 **[DIAGNOSIS_PIPELINE.md](DIAGNOSIS_PIPELINE.md)**
+
 ```
 事件接入 → 指纹计算 → 历史复用检查
                           │
@@ -172,11 +174,15 @@ EOF
 
 ### 结构化输出 (P0)
 
-开启 `diagnosis.structured_output: true` 后，AI 返回结构化 JSON 格式的诊断结果，系统自动解析并进行质量评分（文件引用验证、诊断完整性等），量化置信度。
+开启 `diagnosis.structured_output: true` 后，AI 返回结构化 JSON 格式的诊断结果，系统自动解析并进行六维质量评分（Schema 完整性、证据质量、代码位置验证、内部一致性、修复建议质量、非代码因素），量化置信度。解析失败时依次尝试本地确定性修复和 LLM JSON 修复器兜底。
 
 ### 指纹复用 (P1)
 
-开启 `diagnosis.fingerprint_reuse_enabled: true` 后，系统基于 payload 中的关键字段计算指纹。在配置的时间窗口内，若命中历史高质量报告（且代码未变更或严重度未升级），直接复用历史结论，节省 AI 调用成本。
+开启 `diagnosis.fingerprint_reuse_enabled: true` 后，系统对 payload 进行值归一化（替换时间戳/UUID/内存地址等动态内容）后计算指纹。在配置的时间窗口内，若命中历史高质量报告（质量分 ≥ 80、无幻觉标记、代码版本一致），直接复用历史结论，节省 AI 调用成本。
+
+### 安全校验（只读铁律）
+
+四层防护机制确保 AI 不会修改代码：Amp Permissions 权限规则 → Prompt 约束 → 文件系统权限 → 执行后 git status 校验。详见 [DIAGNOSIS_PIPELINE.md § 安全校验](DIAGNOSIS_PIPELINE.md#7-阶段-6安全校验只读铁律)。
 
 ## 项目配置
 
