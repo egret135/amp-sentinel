@@ -12,7 +12,14 @@ type Project struct {
 	SourceRoot    string   `json:"source_root" yaml:"source_root"`
 	Skills        []string `json:"skills" yaml:"skills"`
 	Owners        []string `json:"owners" yaml:"owners"`
-	FeishuWebhook string   `json:"feishu_webhook" yaml:"feishu_webhook"`
+	FeishuWebhook string             `json:"feishu_webhook" yaml:"feishu_webhook"`
+	Dedup         ProjectDedupConfig `json:"dedup" yaml:"dedup"`
+}
+
+// ProjectDedupConfig holds per-project deduplication settings.
+type ProjectDedupConfig struct {
+	Fields []string `yaml:"fields" json:"fields"`
+	Window string   `yaml:"window" json:"window"`
 }
 
 // Registry holds all registered projects and provides lookup by key.

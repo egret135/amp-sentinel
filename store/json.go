@@ -24,9 +24,9 @@ type JSONStore struct {
 }
 
 type jsonData struct {
-	Incidents map[string]*Incident        `json:"incidents"`
-	Tasks     map[string]*DiagnosisTask   `json:"tasks"`
-	Reports   map[string]*DiagnosisReport `json:"reports"`
+	Events  map[string]*Event           `json:"events"`
+	Tasks   map[string]*DiagnosisTask   `json:"tasks"`
+	Reports map[string]*DiagnosisReport `json:"reports"`
 }
 
 // NewJSONStore creates a new JSONStore. If the file at path exists it is loaded.
@@ -38,9 +38,9 @@ func NewJSONStore(path string, flushInterval time.Duration, log logger.Logger) (
 		flushInterval: flushInterval,
 		stopFlush:     make(chan struct{}),
 		data: jsonData{
-			Incidents: make(map[string]*Incident),
-			Tasks:     make(map[string]*DiagnosisTask),
-			Reports:   make(map[string]*DiagnosisReport),
+			Events:  make(map[string]*Event),
+			Tasks:   make(map[string]*DiagnosisTask),
+			Reports: make(map[string]*DiagnosisReport),
 		},
 	}
 
@@ -69,8 +69,8 @@ func (s *JSONStore) loadFromFile() error {
 	if err := json.Unmarshal(data, &d); err != nil {
 		return fmt.Errorf("unmarshal json store: %w", err)
 	}
-	if d.Incidents == nil {
-		d.Incidents = make(map[string]*Incident)
+	if d.Events == nil {
+		d.Events = make(map[string]*Event)
 	}
 	if d.Tasks == nil {
 		d.Tasks = make(map[string]*DiagnosisTask)
@@ -110,70 +110,77 @@ func (s *JSONStore) flushLoop() {
 	}
 }
 
-// ---------- Incident ----------
+// ---------- Event ----------
 
-func (s *JSONStore) CreateIncident(_ context.Context, inc *Incident) error {
+func (s *JSONStore) CreateEvent(_ context.Context, event *Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.data.Incidents[inc.ID]; exists {
-		return fmt.Errorf("incident %s already exists", inc.ID)
+	if _, exists := s.data.Events[event.ID]; exists {
+		return fmt.Errorf("event %s already exists", event.ID)
 	}
-	clone := *inc
-	if clone.Metadata != nil {
-		clone.Metadata = copyMap(inc.Metadata)
+	clone := *event
+	if clone.Payload != nil {
+		clone.Payload = append(json.RawMessage(nil), event.Payload...)
 	}
-	s.data.Incidents[inc.ID] = &clone
+	s.data.Events[event.ID] = &clone
 	return nil
 }
 
-func (s *JSONStore) GetIncident(_ context.Context, id string) (*Incident, error) {
+func (s *JSONStore) GetEvent(_ context.Context, id string) (*Event, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	inc, ok := s.data.Incidents[id]
+	event, ok := s.data.Events[id]
 	if !ok {
 		return nil, nil
 	}
-	clone := *inc
-	clone.Metadata = copyMap(inc.Metadata)
+	clone := *event
+	if event.Payload != nil {
+		clone.Payload = append(json.RawMessage(nil), event.Payload...)
+	}
 	return &clone, nil
 }
 
-func (s *JSONStore) UpdateIncident(_ context.Context, inc *Incident) error {
+func (s *JSONStore) UpdateEvent(_ context.Context, event *Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.data.Incidents[inc.ID]; !exists {
-		return fmt.Errorf("incident %s not found", inc.ID)
+	if _, exists := s.data.Events[event.ID]; !exists {
+		return fmt.Errorf("event %s not found", event.ID)
 	}
-	clone := *inc
-	if clone.Metadata != nil {
-		clone.Metadata = copyMap(inc.Metadata)
+	clone := *event
+	if clone.Payload != nil {
+		clone.Payload = append(json.RawMessage(nil), event.Payload...)
 	}
-	s.data.Incidents[inc.ID] = &clone
+	s.data.Events[event.ID] = &clone
 	return nil
 }
 
-func (s *JSONStore) ListIncidents(_ context.Context, filter IncidentFilter) ([]*Incident, error) {
+func (s *JSONStore) ListEvents(_ context.Context, filter EventFilter) ([]*Event, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var result []*Incident
-	for _, inc := range s.data.Incidents {
-		if filter.ProjectKey != "" && inc.ProjectKey != filter.ProjectKey {
+	var result []*Event
+	for _, event := range s.data.Events {
+		if filter.ProjectKey != "" && event.ProjectKey != filter.ProjectKey {
 			continue
 		}
-		if filter.Status != "" && inc.Status != filter.Status {
+		if filter.Source != "" && event.Source != filter.Source {
 			continue
 		}
-		if filter.Severity != "" && inc.Severity != filter.Severity {
+		if filter.Status != "" && event.Status != filter.Status {
 			continue
 		}
-		clone := *inc
-		clone.Metadata = copyMap(inc.Metadata)
+		if filter.Severity != "" && event.Severity != filter.Severity {
+			continue
+		}
+		clone := *event
+		if event.Payload != nil {
+			clone.Payload = append(json.RawMessage(nil), event.Payload...)
+		}
 		result = append(result, &clone)
 	}
 
 	sort.Slice(result, func(i, j int) bool {
-		return result[i].OccurredAt.After(result[j].OccurredAt)
+		return result[i].ReceivedAt.After(result[j].ReceivedAt)
 	})
 
 	limit := filter.Limit
@@ -243,7 +250,7 @@ func (s *JSONStore) ListTasks(_ context.Context, filter TaskFilter) ([]*Diagnosi
 
 	var result []*DiagnosisTask
 	for _, task := range s.data.Tasks {
-		if filter.IncidentID != "" && task.IncidentID != filter.IncidentID {
+		if filter.EventID != "" && task.EventID != filter.EventID {
 			continue
 		}
 		if filter.ProjectKey != "" && task.ProjectKey != filter.ProjectKey {
@@ -309,6 +316,12 @@ func (s *JSONStore) SaveReport(_ context.Context, report *DiagnosisReport) error
 	if clone.SkillsUsed != nil {
 		clone.SkillsUsed = append([]string(nil), report.SkillsUsed...)
 	}
+	if clone.StructuredResult != nil {
+		clone.StructuredResult = append(json.RawMessage(nil), report.StructuredResult...)
+	}
+	if clone.QualityScore != nil {
+		clone.QualityScore = append(json.RawMessage(nil), report.QualityScore...)
+	}
 	s.data.Reports[report.ID] = &clone
 	return nil
 }
@@ -325,38 +338,58 @@ func (s *JSONStore) GetReport(_ context.Context, taskID string) (*DiagnosisRepor
 			if report.SkillsUsed != nil {
 				clone.SkillsUsed = append([]string(nil), report.SkillsUsed...)
 			}
+			if report.StructuredResult != nil {
+				clone.StructuredResult = append(json.RawMessage(nil), report.StructuredResult...)
+			}
+			if report.QualityScore != nil {
+				clone.QualityScore = append(json.RawMessage(nil), report.QualityScore...)
+			}
 			return &clone, nil
 		}
 	}
 	return nil, nil
 }
 
-// ---------- Queries ----------
-
-func (s *JSONStore) FindRecentIncident(_ context.Context, projectKey, errorMsg string, window time.Duration) (*Incident, error) {
+func (s *JSONStore) FindRecentReportByFingerprint(_ context.Context, projectKey, fingerprint string, since time.Time) (*DiagnosisReport, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	cutoff := time.Now().Add(-window)
-	var best *Incident
-	for _, inc := range s.data.Incidents {
-		if inc.ProjectKey != projectKey || inc.ErrorMsg != errorMsg {
+	var best *DiagnosisReport
+	for _, report := range s.data.Reports {
+		if report.ProjectKey != projectKey {
 			continue
 		}
-		if inc.OccurredAt.Before(cutoff) {
+		if report.Fingerprint != fingerprint {
 			continue
 		}
-		if best == nil || inc.OccurredAt.After(best.OccurredAt) {
-			best = inc
+		if report.DiagnosedAt.Before(since) {
+			continue
+		}
+		// Skip reports that are themselves reused (only match originals)
+		if report.ReusedFromID != "" {
+			continue
+		}
+		if best == nil || report.DiagnosedAt.After(best.DiagnosedAt) {
+			clone := *report
+			if report.ToolsUsed != nil {
+				clone.ToolsUsed = append([]string(nil), report.ToolsUsed...)
+			}
+			if report.SkillsUsed != nil {
+				clone.SkillsUsed = append([]string(nil), report.SkillsUsed...)
+			}
+			if report.StructuredResult != nil {
+				clone.StructuredResult = append(json.RawMessage(nil), report.StructuredResult...)
+			}
+			if report.QualityScore != nil {
+				clone.QualityScore = append(json.RawMessage(nil), report.QualityScore...)
+			}
+			best = &clone
 		}
 	}
-	if best == nil {
-		return nil, nil
-	}
-	clone := *best
-	clone.Metadata = copyMap(best.Metadata)
-	return &clone, nil
+	return best, nil
 }
+
+// ---------- Queries ----------
 
 func (s *JSONStore) GetUsageSummary(_ context.Context) (*UsageSummary, error) {
 	s.mu.RLock()
@@ -364,13 +397,13 @@ func (s *JSONStore) GetUsageSummary(_ context.Context) (*UsageSummary, error) {
 
 	today := time.Now().Truncate(24 * time.Hour)
 	summary := &UsageSummary{
-		TotalIncidents: len(s.data.Incidents),
+		TotalEvents: len(s.data.Events),
 		TasksByStatus:  make(map[TaskStatus]int),
 	}
 
-	for _, inc := range s.data.Incidents {
-		if !inc.ReportedAt.Before(today) {
-			summary.TodayIncidents++
+	for _, event := range s.data.Events {
+		if !event.ReceivedAt.Before(today) {
+			summary.TodayEvents++
 		}
 	}
 	for _, task := range s.data.Tasks {
@@ -391,17 +424,4 @@ func (s *JSONStore) Close() error {
 		flushErr = s.flush()
 	})
 	return flushErr
-}
-
-// ---------- helpers ----------
-
-func copyMap(m map[string]string) map[string]string {
-	if m == nil {
-		return nil
-	}
-	cp := make(map[string]string, len(m))
-	for k, v := range m {
-		cp[k] = v
-	}
-	return cp
 }

@@ -16,6 +16,7 @@ type Config struct {
 	Amp       AmpConfig              `yaml:"amp"`
 	Scheduler SchedulerConfig        `yaml:"scheduler"`
 	Intake    IntakeConfig           `yaml:"intake"`
+	Diagnosis DiagnosisCfg           `yaml:"diagnosis"`
 	Projects  []project.Project      `yaml:"projects"`
 	Source    SourceConfig           `yaml:"source"`
 	Skill    SkillConfig            `yaml:"skill"`
@@ -23,6 +24,18 @@ type Config struct {
 	Store    StoreConfig            `yaml:"store"`
 	Logger   LoggerConfig           `yaml:"logger"`
 	AdminAPI AdminAPIConfig         `yaml:"admin_api"`
+}
+
+// DiagnosisCfg holds configuration for the diagnosis verification pipeline.
+type DiagnosisCfg struct {
+	StructuredOutput bool   `yaml:"structured_output"`
+	JSONFixerEnabled bool   `yaml:"json_fixer_enabled"`
+	PromptVersion    string `yaml:"prompt_version"`
+
+	// P1: Fingerprint reuse
+	FingerprintReuseEnabled  bool   `yaml:"fingerprint_reuse_enabled"`
+	FingerprintReuseWindow   string `yaml:"fingerprint_reuse_window"`
+	FingerprintReuseMinScore int    `yaml:"fingerprint_reuse_min_score"`
 }
 
 type AmpConfig struct {
@@ -40,11 +53,17 @@ type SchedulerConfig struct {
 }
 
 type IntakeConfig struct {
-	Listen      string `yaml:"listen"`
-	DedupWindow string `yaml:"dedup_window"`
-	RateLimit   int    `yaml:"rate_limit_per_hour"`
-	MinSeverity string `yaml:"min_severity"`
-	AuthToken   string `yaml:"auth_token"`
+	Listen         string      `yaml:"listen"`
+	Dedup          DedupConfig `yaml:"dedup"`
+	RateLimit      int         `yaml:"rate_limit_per_hour"`
+	MinSeverity    string      `yaml:"min_severity"`
+	AuthToken      string      `yaml:"auth_token"`
+	MaxPayloadSize int         `yaml:"max_payload_size"`
+}
+
+type DedupConfig struct {
+	DefaultWindow string   `yaml:"default_window"`
+	DefaultFields []string `yaml:"default_fields"`
 }
 
 type SourceConfig struct {
@@ -169,8 +188,14 @@ func (c *Config) applyDefaults() {
 	if c.Intake.Listen == "" {
 		c.Intake.Listen = ":8080"
 	}
-	if c.Intake.DedupWindow == "" {
-		c.Intake.DedupWindow = "10m"
+	if c.Intake.Dedup.DefaultWindow == "" {
+		c.Intake.Dedup.DefaultWindow = "10m"
+	}
+	if len(c.Intake.Dedup.DefaultFields) == 0 {
+		c.Intake.Dedup.DefaultFields = []string{"error_msg", "error", "message", "msg"}
+	}
+	if c.Intake.MaxPayloadSize == 0 {
+		c.Intake.MaxPayloadSize = 65536
 	}
 	if c.Intake.MinSeverity == "" {
 		c.Intake.MinSeverity = "warning"

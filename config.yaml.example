@@ -15,6 +15,16 @@ scheduler:
   retry_count: 2
   retry_delay: "10s"
 
+# 诊断配置
+diagnosis:
+  structured_output: true
+  json_fixer_enabled: true
+  prompt_version: "v1"
+  # P1: 历史指纹复用
+  fingerprint_reuse_enabled: true
+  fingerprint_reuse_window: "24h"
+  fingerprint_reuse_min_score: 80
+
 # 故障接入配置
 intake:
   listen: ":8080"

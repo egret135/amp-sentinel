@@ -22,6 +22,25 @@ type Report struct {
 	Notified    bool      `json:"notified"`
 	DiagnosedAt time.Time `json:"diagnosed_at"`
 	Usage       *UsageInfo `json:"usage,omitempty"`
+
+	// P0: Structured output
+	StructuredResult *DiagnosisJSON `json:"structured_result,omitempty"`
+
+	// P0: Quality scoring (dynamic max-possible system)
+	QualityScore QualityScore `json:"quality_score"`
+
+	// P0: Confidence (original from AI, final after Reviewer adjustment)
+	OriginalConfidence float64 `json:"original_confidence"`
+	FinalConfidence    float64 `json:"final_confidence"`
+	FinalConfLabel     string  `json:"final_confidence_label"`
+
+	// P1: Historical fingerprint reuse
+	Fingerprint  string `json:"fingerprint,omitempty"`
+	CommitHash   string `json:"commit_hash,omitempty"`
+	ReusedFromID string `json:"reused_from_id,omitempty"`
+
+	// Version tracking for A/B testing
+	PromptVersion string `json:"prompt_version,omitempty"`
 }
 
 // UsageInfo tracks token consumption.

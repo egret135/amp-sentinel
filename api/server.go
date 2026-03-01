@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -21,7 +22,7 @@ type Server struct {
 	registry  *project.Registry
 	sched     *scheduler.Scheduler
 	log       logger.Logger
-	resubmit  func(inc *intake.Incident) (string, error)
+	resubmit  func(event *intake.RawEvent) (string, error)
 	authToken string
 }
 
@@ -31,7 +32,7 @@ func NewServer(
 	reg *project.Registry,
 	sched *scheduler.Scheduler,
 	log logger.Logger,
-	resubmit func(inc *intake.Incident) (string, error),
+	resubmit func(event *intake.RawEvent) (string, error),
 	authToken string,
 ) *Server {
 	return &Server{
@@ -59,8 +60,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/v1/health", s.handleHealth)
 	mux.HandleFunc("/admin/v1/stats", s.handleStats)
 	mux.HandleFunc("/admin/v1/projects", s.handleProjects)
-	mux.HandleFunc("/admin/v1/incidents", s.handleIncidentsList)
-	mux.HandleFunc("/admin/v1/incidents/", s.handleIncidentsDetail)
+	mux.HandleFunc("/admin/v1/incidents", s.handleEventsList)
+	mux.HandleFunc("/admin/v1/incidents/", s.handleEventsDetail)
 	mux.HandleFunc("/admin/v1/tasks", s.handleTasksList)
 	mux.HandleFunc("/admin/v1/tasks/", s.handleTasksDetail)
 	mux.HandleFunc("/admin/v1/reports/", s.handleReports)
@@ -80,7 +81,8 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		token := r.Header.Get("Authorization")
-		if token != "Bearer "+s.authToken {
+		expected := "Bearer " + s.authToken
+		if subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -141,14 +143,14 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sanitized)
 }
 
-func (s *Server) handleIncidentsList(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleEventsList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
 	q := r.URL.Query()
-	filter := store.IncidentFilter{
+	filter := store.EventFilter{
 		ProjectKey: q.Get("project_key"),
 		Status:     q.Get("status"),
 		Severity:   q.Get("severity"),
@@ -159,19 +161,19 @@ func (s *Server) handleIncidentsList(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	incidents, err := s.store.ListIncidents(ctx, filter)
+	events, err := s.store.ListEvents(ctx, filter)
 	if err != nil {
-		s.log.Error("admin.list_incidents_failed", logger.Err(err))
-		writeError(w, http.StatusInternalServerError, "failed to list incidents")
+		s.log.Error("admin.list_events_failed", logger.Err(err))
+		writeError(w, http.StatusInternalServerError, "failed to list events")
 		return
 	}
-	writeJSON(w, http.StatusOK, incidents)
+	writeJSON(w, http.StatusOK, events)
 }
 
-func (s *Server) handleIncidentsDetail(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleEventsDetail(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/admin/v1/incidents/")
 	if path == "" {
-		writeError(w, http.StatusBadRequest, "incident id required")
+		writeError(w, http.StatusBadRequest, "event id required")
 		return
 	}
 
@@ -190,17 +192,17 @@ func (s *Server) handleIncidentsDetail(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	inc, err := s.store.GetIncident(ctx, path)
+	evt, err := s.store.GetEvent(ctx, path)
 	if err != nil {
-		s.log.Error("admin.get_incident_failed", logger.String("id", path), logger.Err(err))
-		writeError(w, http.StatusInternalServerError, "failed to get incident")
+		s.log.Error("admin.get_event_failed", logger.String("id", path), logger.Err(err))
+		writeError(w, http.StatusInternalServerError, "failed to get event")
 		return
 	}
-	if inc == nil {
-		writeError(w, http.StatusNotFound, "incident not found")
+	if evt == nil {
+		writeError(w, http.StatusNotFound, "event not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, inc)
+	writeJSON(w, http.StatusOK, evt)
 }
 
 func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request, id string) {
@@ -212,19 +214,19 @@ func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request, id string) 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	storeInc, err := s.store.GetIncident(ctx, id)
+	storeEvt, err := s.store.GetEvent(ctx, id)
 	if err != nil {
 		s.log.Error("admin.retry_get_failed", logger.String("id", id), logger.Err(err))
-		writeError(w, http.StatusInternalServerError, "failed to get incident")
+		writeError(w, http.StatusInternalServerError, "failed to get event")
 		return
 	}
-	if storeInc == nil {
-		writeError(w, http.StatusNotFound, "incident not found")
+	if storeEvt == nil {
+		writeError(w, http.StatusNotFound, "event not found")
 		return
 	}
 
 	// Check for active tasks (pending/queued/running)
-	tasks, err := s.store.ListTasks(ctx, store.TaskFilter{IncidentID: id, Limit: 100})
+	tasks, err := s.store.ListTasks(ctx, store.TaskFilter{EventID: id, Limit: 100})
 	if err != nil {
 		s.log.Error("admin.retry_list_tasks_failed", logger.String("id", id), logger.Err(err))
 		writeError(w, http.StatusInternalServerError, "failed to check active tasks")
@@ -237,23 +239,17 @@ func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request, id string) 
 		}
 	}
 
-	inc := &intake.Incident{
-		ID:          storeInc.ID,
-		ProjectKey:  storeInc.ProjectKey,
-		Title:       storeInc.Title,
-		ErrorType:   storeInc.ErrorType,
-		ErrorMsg:    storeInc.ErrorMsg,
-		Stacktrace:  storeInc.Stacktrace,
-		Environment: storeInc.Environment,
-		Severity:    storeInc.Severity,
-		URL:         storeInc.URL,
-		Source:      storeInc.Source,
-		Metadata:    storeInc.Metadata,
-		OccurredAt:  storeInc.OccurredAt,
-		ReportedAt:  storeInc.ReportedAt,
+	event := &intake.RawEvent{
+		ID:         storeEvt.ID,
+		ProjectKey: storeEvt.ProjectKey,
+		Payload:    storeEvt.Payload,
+		Source:     storeEvt.Source,
+		Severity:   storeEvt.Severity,
+		Title:      storeEvt.Title,
+		ReceivedAt: storeEvt.ReceivedAt,
 	}
 
-	taskID, err := s.resubmit(inc)
+	taskID, err := s.resubmit(event)
 	if err != nil {
 		s.log.Error("admin.retry_submit_failed", logger.String("id", id), logger.Err(err))
 		writeError(w, http.StatusInternalServerError, "failed to resubmit incident")
@@ -279,7 +275,7 @@ func (s *Server) handleTasksList(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 	filter := store.TaskFilter{
-		IncidentID: q.Get("incident_id"),
+		EventID: coalesce(q.Get("event_id"), q.Get("incident_id")),
 		ProjectKey: q.Get("project_key"),
 		Status:     store.TaskStatus(q.Get("status")),
 		Limit:      parseIntParam(q.Get("limit"), 50),
@@ -362,6 +358,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func coalesce(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func parseIntParam(s string, defaultVal int) int {

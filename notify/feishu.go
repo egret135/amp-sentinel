@@ -60,7 +60,7 @@ func NewFeishuNotifier(cfg FeishuConfig, log logger.Logger) *FeishuNotifier {
 }
 
 // Notify sends a diagnosis report to the appropriate Feishu webhook.
-func (f *FeishuNotifier) Notify(ctx context.Context, proj *project.Project, inc *intake.Incident, report *diagnosis.Report) error {
+func (f *FeishuNotifier) Notify(ctx context.Context, proj *project.Project, event *intake.RawEvent, report *diagnosis.Report) error {
 	webhook := proj.FeishuWebhook
 	if webhook == "" {
 		webhook = f.defaultWebhook
@@ -69,7 +69,7 @@ func (f *FeishuNotifier) Notify(ctx context.Context, proj *project.Project, inc 
 		return fmt.Errorf("no feishu webhook configured for project %s", proj.Key)
 	}
 
-	card := f.buildCard(proj, inc, report)
+	card := f.buildCard(proj, event, report)
 	payload := map[string]any{
 		"msg_type": "interactive",
 		"card":     card,
@@ -111,11 +111,10 @@ func (f *FeishuNotifier) Notify(ctx context.Context, proj *project.Project, inc 
 			continue
 		}
 
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB max
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK {
-			// Feishu returns 200 even on logical errors; check response body
 			var feishuResp struct {
 				Code int    `json:"code"`
 				Msg  string `json:"msg"`
@@ -127,7 +126,7 @@ func (f *FeishuNotifier) Notify(ctx context.Context, proj *project.Project, inc 
 			}
 			f.log.Info("feishu.sent",
 				logger.String("project", proj.Key),
-				logger.String("incident_id", inc.ID),
+				logger.String("event_id", event.ID),
 			)
 			return nil
 		}
@@ -139,8 +138,7 @@ func (f *FeishuNotifier) Notify(ctx context.Context, proj *project.Project, inc 
 	return fmt.Errorf("feishu notification failed after %d attempts: %w", f.retryCount, lastErr)
 }
 
-func (f *FeishuNotifier) buildCard(proj *project.Project, inc *intake.Incident, report *diagnosis.Report) map[string]any {
-	// Determine header color and title
+func (f *FeishuNotifier) buildCard(proj *project.Project, event *intake.RawEvent, report *diagnosis.Report) map[string]any {
 	var template, titlePrefix string
 	switch {
 	case report.Tainted:
@@ -157,27 +155,68 @@ func (f *FeishuNotifier) buildCard(proj *project.Project, inc *intake.Incident, 
 		titlePrefix = "🟡 故障诊断报告（未定位到代码问题）"
 	}
 
-	title := fmt.Sprintf("%s — %s", titlePrefix, proj.Name)
+	cardTitle := fmt.Sprintf("%s — %s", titlePrefix, proj.Name)
 
-	// Incident summary
+	// Extract display fields from payload
+	var payloadMap map[string]any
+	json.Unmarshal(event.Payload, &payloadMap)
+	df := intake.ExtractDisplayFields(payloadMap)
+
+	// Build event summary lines
+	var eventLines []string
+
+	displayTitle := event.Title
+	if displayTitle == "" && df.ErrorMsg != "" {
+		displayTitle = df.ErrorMsg
+	}
+	fallbackTitle := fmt.Sprintf("来自 %s 的事件", event.Source)
+	if displayTitle == "" {
+		displayTitle = fallbackTitle
+	}
+	eventLines = append(eventLines,
+		fmt.Sprintf("**标题**: %s", intake.EscapeLarkMD(displayTitle)))
+
+	eventLines = append(eventLines,
+		fmt.Sprintf("**严重程度**: %s", strings.ToUpper(event.Severity)))
+
+	eventLines = append(eventLines,
+		fmt.Sprintf("**来源**: %s", intake.EscapeLarkMD(event.Source)))
+
+	if df.Environment != "" {
+		eventLines = append(eventLines,
+			fmt.Sprintf("**环境**: %s", intake.EscapeLarkMD(df.Environment)))
+	}
+
+	if df.OccurredAt != "" {
+		eventLines = append(eventLines,
+			fmt.Sprintf("**发生时间**: %s", df.OccurredAt))
+	}
+
+	if df.URL != "" {
+		eventLines = append(eventLines,
+			fmt.Sprintf("**URL/路径**: %s", intake.EscapeLarkMD(df.URL)))
+	}
+
+	if displayTitle == fallbackTitle && df == (intake.DisplayFields{}) && len(event.Payload) > 0 {
+		preview := intake.SanitizeDisplayText(intake.TruncateRunes(string(event.Payload), 200))
+		if preview != "" {
+			eventLines = append(eventLines,
+				fmt.Sprintf("**原始数据**: %s", intake.EscapeLarkMD(preview)))
+		}
+	}
+
 	elements := []map[string]any{
 		{
 			"tag": "div",
 			"text": map[string]any{
-				"tag": "lark_md",
-				"content": fmt.Sprintf(
-					"**故障标题**: %s\n**严重程度**: %s\n**环境**: %s\n**发生时间**: %s",
-					inc.Title,
-					strings.ToUpper(inc.Severity),
-					inc.Environment,
-					inc.OccurredAt.Format("2006-01-02 15:04:05"),
-				),
+				"tag":     "lark_md",
+				"content": strings.Join(eventLines, "\n"),
 			},
 		},
 		{"tag": "hr"},
 	}
 
-	// Brief diagnosis summary (truncated to 200 chars)
+	// Diagnosis summary
 	summary := report.Summary
 	if summary == "" {
 		summary = report.RawResult
@@ -193,12 +232,49 @@ func (f *FeishuNotifier) buildCard(proj *project.Project, inc *intake.Incident, 
 		resultIcon = "🟢 未发现代码问题"
 	}
 
-	durationStr := fmt.Sprintf("%.1fs", float64(report.DurationMs)/1000)
+	confidenceMap := map[string]string{
+		"high": "高", "medium": "中", "low": "低",
+	}
+	confidenceStr := confidenceMap[report.Confidence]
+	if confidenceStr == "" {
+		confidenceStr = report.Confidence
+	}
+
+	var diagContent string
+	if report.ReusedFromID != "" {
+		diagContent = fmt.Sprintf(
+			"**诊断结论**: %s\n**置信度**: %s\n**摘要**: %s\n**执行方式**: 复用历史诊断（未重新执行 AI 分析）",
+			resultIcon, confidenceStr, intake.EscapeLarkMD(summary))
+	} else {
+		durationStr := fmt.Sprintf("%.1fs", float64(report.DurationMs)/1000)
+		diagContent = fmt.Sprintf(
+			"**诊断结论**: %s\n**置信度**: %s\n**摘要**: %s\n**耗时**: %s | **对话轮次**: %d",
+			resultIcon, confidenceStr, intake.EscapeLarkMD(summary),
+			durationStr, report.NumTurns)
+	}
+
+	if report.QualityScore.Normalized > 0 {
+		diagContent += fmt.Sprintf("\n**质量评分**: %d/100", report.QualityScore.Normalized)
+	}
+	if len(report.QualityScore.Flags) > 0 {
+		diagContent += fmt.Sprintf("\n**质量标记**: %s", strings.Join(report.QualityScore.Flags, ", "))
+	}
+	if report.ReusedFromID != "" {
+		commitNote := "commit 一致"
+		for _, flag := range report.QualityScore.Flags {
+			if flag == "REUSED_STALE_COMMIT" {
+				commitNote = "⚠️ commit 已变更"
+				break
+			}
+		}
+		diagContent += fmt.Sprintf("\n**复用自**: %s (%s)", intake.EscapeLarkMD(report.ReusedFromID), commitNote)
+	}
+
 	elements = append(elements, map[string]any{
 		"tag": "div",
 		"text": map[string]any{
 			"tag":     "lark_md",
-			"content": fmt.Sprintf("**诊断结论**: %s\n**摘要**: %s\n**耗时**: %s | **对话轮次**: %d", resultIcon, summary, durationStr, report.NumTurns),
+			"content": diagContent,
 		},
 	})
 
@@ -251,7 +327,7 @@ func (f *FeishuNotifier) buildCard(proj *project.Project, inc *intake.Incident, 
 
 	return map[string]any{
 		"header": map[string]any{
-			"title":    map[string]any{"tag": "plain_text", "content": title},
+			"title":    map[string]any{"tag": "plain_text", "content": cardTitle},
 			"template": template,
 		},
 		"elements": elements,

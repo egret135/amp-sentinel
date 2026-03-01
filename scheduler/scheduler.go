@@ -15,7 +15,7 @@ import (
 
 // DiagnoseFunc is the function the scheduler calls to run a diagnosis.
 // taskID is the scheduler-assigned task identifier for tracking.
-type DiagnoseFunc func(ctx context.Context, taskID string, inc *intake.Incident) error
+type DiagnoseFunc func(ctx context.Context, taskID string, event *intake.RawEvent) error
 
 // Config holds scheduler configuration.
 type Config struct {
@@ -85,7 +85,7 @@ func (s *Scheduler) Start() {
 
 // Submit enqueues an incident for diagnosis. Returns the task ID.
 // Tasks are dequeued in priority order (critical before warning before info).
-func (s *Scheduler) Submit(inc *intake.Incident) (string, error) {
+func (s *Scheduler) Submit(event *intake.RawEvent) (string, error) {
 	s.stopMu.Lock()
 	defer s.stopMu.Unlock()
 
@@ -95,8 +95,8 @@ func (s *Scheduler) Submit(inc *intake.Incident) (string, error) {
 
 	task := &Task{
 		ID:         "task-" + uuid.New().String()[:8],
-		Incident:   inc,
-		Priority:   intake.SeverityPriority(inc.Severity),
+		Event:      event,
+		Priority:   intake.SeverityPriority(event.Severity),
 		Status:     StatusPending,
 		MaxRetries: s.cfg.RetryCount,
 		CreatedAt:  time.Now(),
@@ -108,8 +108,8 @@ func (s *Scheduler) Submit(inc *intake.Incident) (string, error) {
 
 	s.log.Info("task.submitted",
 		logger.String("task_id", task.ID),
-		logger.String("incident_id", inc.ID),
-		logger.String("project", inc.ProjectKey),
+		logger.String("incident_id", event.ID),
+		logger.String("project", event.ProjectKey),
 		logger.Int("priority", task.Priority),
 	)
 	return task.ID, nil
@@ -180,8 +180,8 @@ func (s *Scheduler) safeProcessTask(task *Task) {
 func (s *Scheduler) processTask(task *Task) {
 	log := s.log.WithFields(
 		logger.String("task_id", task.ID),
-		logger.String("incident_id", task.Incident.ID),
-		logger.String("project", task.Incident.ProjectKey),
+		logger.String("incident_id", task.Event.ID),
+		logger.String("project", task.Event.ProjectKey),
 	)
 
 	for attempt := 0; attempt <= task.MaxRetries; attempt++ {
@@ -206,7 +206,7 @@ func (s *Scheduler) processTask(task *Task) {
 		task.StartedAt = time.Now()
 
 		taskCtx, cancel := context.WithTimeout(s.ctx, s.cfg.DefaultTimeout)
-		err := s.diagnose(taskCtx, task.ID, task.Incident)
+		err := s.diagnose(taskCtx, task.ID, task.Event)
 		cancel()
 
 		if err == nil {

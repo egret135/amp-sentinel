@@ -64,27 +64,21 @@ func NewMySQLStore(cfg MySQLConfig, log logger.Logger) (*MySQLStore, error) {
 
 func (s *MySQLStore) initSchema() error {
 	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS incidents (
+		`CREATE TABLE IF NOT EXISTS events (
     id VARCHAR(64) PRIMARY KEY,
     project_key VARCHAR(128) NOT NULL,
-    title VARCHAR(512) NOT NULL,
-    error_type VARCHAR(256) NOT NULL DEFAULT '',
-    error_msg TEXT NOT NULL,
-    stacktrace LONGTEXT NOT NULL,
-    environment VARCHAR(64) NOT NULL DEFAULT 'production',
-    severity VARCHAR(32) NOT NULL DEFAULT 'warning',
-    url VARCHAR(2048) NOT NULL DEFAULT '',
-    metadata JSON NOT NULL,
+    payload LONGTEXT NOT NULL,
     source VARCHAR(64) NOT NULL DEFAULT 'custom',
+    severity VARCHAR(32) NOT NULL DEFAULT 'warning',
+    title VARCHAR(512) NOT NULL DEFAULT '',
     status VARCHAR(32) NOT NULL DEFAULT 'pending',
-    occurred_at DATETIME(3) NOT NULL,
-    reported_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+    received_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
-		`CREATE INDEX idx_incidents_project_key ON incidents(project_key)`,
-		`CREATE INDEX idx_incidents_status ON incidents(status)`,
-		`CREATE INDEX idx_incidents_occurred_at ON incidents(occurred_at)`,
-		`CREATE INDEX idx_incidents_dedup ON incidents(project_key, error_msg(255), occurred_at)`,
+		`CREATE INDEX idx_events_project_key ON events(project_key)`,
+		`CREATE INDEX idx_events_status ON events(status)`,
+		`CREATE INDEX idx_events_received_at ON events(received_at)`,
+		`CREATE INDEX idx_events_severity ON events(severity)`,
 
 		`CREATE TABLE IF NOT EXISTS diagnosis_tasks (
     id VARCHAR(64) PRIMARY KEY,
@@ -102,7 +96,7 @@ func (s *MySQLStore) initSchema() error {
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     started_at DATETIME(3) NULL,
     finished_at DATETIME(3) NULL,
-    CONSTRAINT fk_tasks_incident FOREIGN KEY (incident_id) REFERENCES incidents(id)
+    CONSTRAINT fk_tasks_event FOREIGN KEY (incident_id) REFERENCES events(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
 		`CREATE INDEX idx_tasks_status ON diagnosis_tasks(status)`,
@@ -123,11 +117,30 @@ func (s *MySQLStore) initSchema() error {
     tainted TINYINT(1) NOT NULL DEFAULT 0,
     notified TINYINT(1) NOT NULL DEFAULT 0,
     diagnosed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    structured_result JSON NOT NULL,
+    quality_score JSON NOT NULL,
+    commit_hash VARCHAR(128) NOT NULL DEFAULT '',
+    prompt_version VARCHAR(32) NOT NULL DEFAULT '',
+    original_confidence DOUBLE NOT NULL DEFAULT 0,
+    final_confidence DOUBLE NOT NULL DEFAULT 0,
+    final_confidence_label VARCHAR(32) NOT NULL DEFAULT '',
     CONSTRAINT fk_reports_task FOREIGN KEY (task_id) REFERENCES diagnosis_tasks(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
 		`CREATE INDEX idx_reports_task ON diagnosis_reports(task_id)`,
 		`CREATE INDEX idx_reports_project ON diagnosis_reports(project_key)`,
+
+		// Migration: add new columns to diagnosis_reports for existing tables.
+		`ALTER TABLE diagnosis_reports ADD COLUMN structured_result JSON NOT NULL DEFAULT (CAST('null' AS JSON))`,
+		`ALTER TABLE diagnosis_reports ADD COLUMN quality_score JSON NOT NULL DEFAULT (CAST('{}' AS JSON))`,
+		`ALTER TABLE diagnosis_reports ADD COLUMN commit_hash VARCHAR(128) NOT NULL DEFAULT ''`,
+		`ALTER TABLE diagnosis_reports ADD COLUMN prompt_version VARCHAR(32) NOT NULL DEFAULT ''`,
+		`ALTER TABLE diagnosis_reports ADD COLUMN original_confidence DOUBLE NOT NULL DEFAULT 0`,
+		`ALTER TABLE diagnosis_reports ADD COLUMN final_confidence DOUBLE NOT NULL DEFAULT 0`,
+		`ALTER TABLE diagnosis_reports ADD COLUMN final_confidence_label VARCHAR(32) NOT NULL DEFAULT ''`,
+		`ALTER TABLE diagnosis_reports ADD COLUMN fingerprint VARCHAR(256) NOT NULL DEFAULT ''`,
+		`ALTER TABLE diagnosis_reports ADD COLUMN reused_from_id VARCHAR(64) NOT NULL DEFAULT ''`,
+		`CREATE INDEX idx_reports_fingerprint ON diagnosis_reports(project_key, fingerprint, diagnosed_at)`,
 	}
 
 	for _, stmt := range stmts {
@@ -142,75 +155,72 @@ func (s *MySQLStore) initSchema() error {
 }
 
 func isDuplicateKeyError(err error) bool {
-	return strings.Contains(err.Error(), "Duplicate key name") || strings.Contains(err.Error(), "already exists")
+	msg := err.Error()
+	return strings.Contains(msg, "Duplicate key name") ||
+		strings.Contains(msg, "Duplicate column name") ||
+		strings.Contains(msg, "already exists")
 }
 
-func (s *MySQLStore) CreateIncident(ctx context.Context, inc *Incident) error {
-	md := inc.Metadata
-	if md == nil {
-		md = map[string]string{}
-	}
-	metadata, err := json.Marshal(md)
-	if err != nil {
-		return fmt.Errorf("marshal metadata: %w", err)
+func (s *MySQLStore) CreateEvent(ctx context.Context, event *Event) error {
+	payload := event.Payload
+	if payload == nil {
+		payload = json.RawMessage("{}")
 	}
 
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO incidents (id, project_key, title, error_type, error_msg, stacktrace, environment, severity, url, metadata, source, status, occurred_at, reported_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		inc.ID, inc.ProjectKey, inc.Title, inc.ErrorType, inc.ErrorMsg, inc.Stacktrace,
-		inc.Environment, inc.Severity, inc.URL, string(metadata), inc.Source, inc.Status,
-		inc.OccurredAt, inc.ReportedAt,
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO events (id, project_key, payload, source, severity, title, status, received_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ID, event.ProjectKey, string(payload), event.Source, event.Severity,
+		event.Title, event.Status, event.ReceivedAt,
 	)
 	if err != nil {
-		return fmt.Errorf("insert incident: %w", err)
+		return fmt.Errorf("insert event: %w", err)
 	}
 	return nil
 }
 
-func (s *MySQLStore) GetIncident(ctx context.Context, id string) (*Incident, error) {
+func (s *MySQLStore) GetEvent(ctx context.Context, id string) (*Event, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, project_key, title, error_type, error_msg, stacktrace, environment, severity, url, metadata, source, status, occurred_at, reported_at
-		 FROM incidents WHERE id = ?`, id)
+		`SELECT id, project_key, payload, source, severity, title, status, received_at
+		 FROM events WHERE id = ?`, id)
 
-	inc, err := s.scanIncident(row)
+	event, err := s.scanEvent(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return inc, err
+	return event, err
 }
 
-func (s *MySQLStore) UpdateIncident(ctx context.Context, inc *Incident) error {
-	md := inc.Metadata
-	if md == nil {
-		md = map[string]string{}
-	}
-	metadata, err := json.Marshal(md)
-	if err != nil {
-		return fmt.Errorf("marshal metadata: %w", err)
+func (s *MySQLStore) UpdateEvent(ctx context.Context, event *Event) error {
+	payload := event.Payload
+	if payload == nil {
+		payload = json.RawMessage("{}")
 	}
 
-	_, err = s.db.ExecContext(ctx,
-		`UPDATE incidents SET project_key=?, title=?, error_type=?, error_msg=?, stacktrace=?, environment=?, severity=?, url=?, metadata=?, source=?, status=?, occurred_at=?, reported_at=?
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE events SET project_key=?, payload=?, source=?, severity=?, title=?, status=?, received_at=?
 		 WHERE id=?`,
-		inc.ProjectKey, inc.Title, inc.ErrorType, inc.ErrorMsg, inc.Stacktrace,
-		inc.Environment, inc.Severity, inc.URL, string(metadata), inc.Source, inc.Status,
-		inc.OccurredAt, inc.ReportedAt, inc.ID,
+		event.ProjectKey, string(payload), event.Source, event.Severity,
+		event.Title, event.Status, event.ReceivedAt, event.ID,
 	)
 	if err != nil {
-		return fmt.Errorf("update incident: %w", err)
+		return fmt.Errorf("update event: %w", err)
 	}
 	return nil
 }
 
-func (s *MySQLStore) ListIncidents(ctx context.Context, filter IncidentFilter) ([]*Incident, error) {
-	query := "SELECT id, project_key, title, error_type, error_msg, stacktrace, environment, severity, url, metadata, source, status, occurred_at, reported_at FROM incidents"
+func (s *MySQLStore) ListEvents(ctx context.Context, filter EventFilter) ([]*Event, error) {
+	query := "SELECT id, project_key, payload, source, severity, title, status, received_at FROM events"
 	var conditions []string
 	var args []any
 
 	if filter.ProjectKey != "" {
 		conditions = append(conditions, "project_key = ?")
 		args = append(args, filter.ProjectKey)
+	}
+	if filter.Source != "" {
+		conditions = append(conditions, "source = ?")
+		args = append(args, filter.Source)
 	}
 	if filter.Status != "" {
 		conditions = append(conditions, "status = ?")
@@ -225,7 +235,7 @@ func (s *MySQLStore) ListIncidents(ctx context.Context, filter IncidentFilter) (
 		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
 
-	query += " ORDER BY occurred_at DESC"
+	query += " ORDER BY received_at DESC"
 
 	limit := filter.Limit
 	if limit <= 0 {
@@ -239,19 +249,19 @@ func (s *MySQLStore) ListIncidents(ctx context.Context, filter IncidentFilter) (
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list incidents: %w", err)
+		return nil, fmt.Errorf("list events: %w", err)
 	}
 	defer rows.Close()
 
-	var incidents []*Incident
+	var events []*Event
 	for rows.Next() {
-		inc, err := s.scanIncident(rows)
+		event, err := s.scanEvent(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan incident: %w", err)
+			return nil, fmt.Errorf("scan event: %w", err)
 		}
-		incidents = append(incidents, inc)
+		events = append(events, event)
 	}
-	return incidents, rows.Err()
+	return events, rows.Err()
 }
 
 func (s *MySQLStore) CreateTask(ctx context.Context, task *DiagnosisTask) error {
@@ -266,7 +276,7 @@ func (s *MySQLStore) CreateTask(ctx context.Context, task *DiagnosisTask) error 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO diagnosis_tasks (id, incident_id, project_key, status, priority, session_id, num_turns, duration_ms, input_tokens, output_tokens, error, retry_count, created_at, started_at, finished_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		task.ID, task.IncidentID, task.ProjectKey, string(task.Status), task.Priority,
+		task.ID, task.EventID, task.ProjectKey, string(task.Status), task.Priority,
 		task.SessionID, task.NumTurns, task.DurationMs, task.InputTokens, task.OutputTokens,
 		task.Error, task.RetryCount, task.CreatedAt, startedAt, finishedAt,
 	)
@@ -300,7 +310,7 @@ func (s *MySQLStore) UpdateTask(ctx context.Context, task *DiagnosisTask) error 
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE diagnosis_tasks SET incident_id=?, project_key=?, status=?, priority=?, session_id=?, num_turns=?, duration_ms=?, input_tokens=?, output_tokens=?, error=?, retry_count=?, created_at=?, started_at=?, finished_at=?
 		 WHERE id=?`,
-		task.IncidentID, task.ProjectKey, string(task.Status), task.Priority,
+		task.EventID, task.ProjectKey, string(task.Status), task.Priority,
 		task.SessionID, task.NumTurns, task.DurationMs, task.InputTokens, task.OutputTokens,
 		task.Error, task.RetryCount, task.CreatedAt, startedAt, finishedAt, task.ID,
 	)
@@ -315,9 +325,9 @@ func (s *MySQLStore) ListTasks(ctx context.Context, filter TaskFilter) ([]*Diagn
 	var conditions []string
 	var args []any
 
-	if filter.IncidentID != "" {
+	if filter.EventID != "" {
 		conditions = append(conditions, "incident_id = ?")
-		args = append(args, filter.IncidentID)
+		args = append(args, filter.EventID)
 	}
 	if filter.ProjectKey != "" {
 		conditions = append(conditions, "project_key = ?")
@@ -398,12 +408,24 @@ func (s *MySQLStore) SaveReport(ctx context.Context, report *DiagnosisReport) er
 		return fmt.Errorf("marshal skills_used: %w", err)
 	}
 
+	structuredResult := json.RawMessage("null")
+	if report.StructuredResult != nil {
+		structuredResult = report.StructuredResult
+	}
+	qualityScore := json.RawMessage("null")
+	if report.QualityScore != nil {
+		qualityScore = report.QualityScore
+	}
+
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO diagnosis_reports (id, task_id, incident_id, project_key, project_name, summary, raw_result, has_issue, confidence, tools_used, skills_used, tainted, notified, diagnosed_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		report.ID, report.TaskID, report.IncidentID, report.ProjectKey, report.ProjectName,
+		`INSERT INTO diagnosis_reports (id, task_id, incident_id, project_key, project_name, summary, raw_result, has_issue, confidence, tools_used, skills_used, tainted, notified, diagnosed_at, structured_result, quality_score, commit_hash, prompt_version, original_confidence, final_confidence, final_confidence_label, fingerprint, reused_from_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		report.ID, report.TaskID, report.EventID, report.ProjectKey, report.ProjectName,
 		report.Summary, report.RawResult, report.HasIssue, report.Confidence,
 		string(toolsUsed), string(skillsUsed), report.Tainted, report.Notified, report.DiagnosedAt,
+		string(structuredResult), string(qualityScore), report.CommitHash, report.PromptVersion,
+		report.OriginalConfidence, report.FinalConfidence, report.FinalConfLabel,
+		report.Fingerprint, report.ReusedFromID,
 	)
 	if err != nil {
 		return fmt.Errorf("insert report: %w", err)
@@ -413,7 +435,7 @@ func (s *MySQLStore) SaveReport(ctx context.Context, report *DiagnosisReport) er
 
 func (s *MySQLStore) GetReport(ctx context.Context, taskID string) (*DiagnosisReport, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, task_id, incident_id, project_key, project_name, summary, raw_result, has_issue, confidence, tools_used, skills_used, tainted, notified, diagnosed_at
+		`SELECT id, task_id, incident_id, project_key, project_name, summary, raw_result, has_issue, confidence, tools_used, skills_used, tainted, notified, diagnosed_at, structured_result, quality_score, commit_hash, prompt_version, original_confidence, final_confidence, final_confidence_label, fingerprint, reused_from_id
 		 FROM diagnosis_reports WHERE task_id = ?`, taskID)
 
 	report, err := s.scanReport(row)
@@ -423,18 +445,18 @@ func (s *MySQLStore) GetReport(ctx context.Context, taskID string) (*DiagnosisRe
 	return report, err
 }
 
-func (s *MySQLStore) FindRecentIncident(ctx context.Context, projectKey, errorMsg string, window time.Duration) (*Incident, error) {
-	cutoff := time.Now().Add(-window)
+func (s *MySQLStore) FindRecentReportByFingerprint(ctx context.Context, projectKey, fingerprint string, since time.Time) (*DiagnosisReport, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, project_key, title, error_type, error_msg, stacktrace, environment, severity, url, metadata, source, status, occurred_at, reported_at
-		 FROM incidents WHERE project_key = ? AND error_msg = ? AND occurred_at > ? ORDER BY occurred_at DESC LIMIT 1`,
-		projectKey, errorMsg, cutoff)
+		`SELECT id, task_id, incident_id, project_key, project_name, summary, raw_result, has_issue, confidence, tools_used, skills_used, tainted, notified, diagnosed_at, structured_result, quality_score, commit_hash, prompt_version, original_confidence, final_confidence, final_confidence_label, fingerprint, reused_from_id
+		 FROM diagnosis_reports
+		 WHERE project_key = ? AND fingerprint = ? AND diagnosed_at > ? AND reused_from_id = ''
+		 ORDER BY diagnosed_at DESC LIMIT 1`, projectKey, fingerprint, since)
 
-	inc, err := s.scanIncident(row)
+	report, err := s.scanReport(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return inc, err
+	return report, err
 }
 
 func (s *MySQLStore) GetUsageSummary(ctx context.Context) (*UsageSummary, error) {
@@ -442,14 +464,14 @@ func (s *MySQLStore) GetUsageSummary(ctx context.Context) (*UsageSummary, error)
 		TasksByStatus: make(map[TaskStatus]int),
 	}
 
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM incidents").Scan(&summary.TotalIncidents)
+	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM events").Scan(&summary.TotalEvents)
 	if err != nil {
-		return nil, fmt.Errorf("count incidents: %w", err)
+		return nil, fmt.Errorf("count events: %w", err)
 	}
 
-	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM incidents WHERE DATE(reported_at) = CURDATE()").Scan(&summary.TodayIncidents)
+	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE DATE(received_at) = CURDATE()").Scan(&summary.TodayEvents)
 	if err != nil {
-		return nil, fmt.Errorf("count today incidents: %w", err)
+		return nil, fmt.Errorf("count today events: %w", err)
 	}
 
 	statusCounts, err := s.CountByStatus(ctx)
@@ -480,21 +502,18 @@ type mysqlScannable interface {
 	Scan(dest ...any) error
 }
 
-func (s *MySQLStore) scanIncident(row mysqlScannable) (*Incident, error) {
-	var inc Incident
-	var metadataStr string
+func (s *MySQLStore) scanEvent(row mysqlScannable) (*Event, error) {
+	var event Event
+	var payloadStr string
 	err := row.Scan(
-		&inc.ID, &inc.ProjectKey, &inc.Title, &inc.ErrorType, &inc.ErrorMsg, &inc.Stacktrace,
-		&inc.Environment, &inc.Severity, &inc.URL, &metadataStr, &inc.Source, &inc.Status,
-		&inc.OccurredAt, &inc.ReportedAt,
+		&event.ID, &event.ProjectKey, &payloadStr, &event.Source,
+		&event.Severity, &event.Title, &event.Status, &event.ReceivedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal([]byte(metadataStr), &inc.Metadata); err != nil {
-		return nil, fmt.Errorf("unmarshal metadata: %w", err)
-	}
-	return &inc, nil
+	event.Payload = json.RawMessage(payloadStr)
+	return &event, nil
 }
 
 func (s *MySQLStore) scanTask(row mysqlScannable) (*DiagnosisTask, error) {
@@ -502,7 +521,7 @@ func (s *MySQLStore) scanTask(row mysqlScannable) (*DiagnosisTask, error) {
 	var status string
 	var startedAt, finishedAt sql.NullTime
 	err := row.Scan(
-		&task.ID, &task.IncidentID, &task.ProjectKey, &status, &task.Priority,
+		&task.ID, &task.EventID, &task.ProjectKey, &status, &task.Priority,
 		&task.SessionID, &task.NumTurns, &task.DurationMs, &task.InputTokens, &task.OutputTokens,
 		&task.Error, &task.RetryCount, &task.CreatedAt, &startedAt, &finishedAt,
 	)
@@ -522,10 +541,14 @@ func (s *MySQLStore) scanTask(row mysqlScannable) (*DiagnosisTask, error) {
 func (s *MySQLStore) scanReport(row mysqlScannable) (*DiagnosisReport, error) {
 	var report DiagnosisReport
 	var toolsUsedStr, skillsUsedStr string
+	var structuredResult, qualityScore []byte
 	err := row.Scan(
-		&report.ID, &report.TaskID, &report.IncidentID, &report.ProjectKey, &report.ProjectName,
+		&report.ID, &report.TaskID, &report.EventID, &report.ProjectKey, &report.ProjectName,
 		&report.Summary, &report.RawResult, &report.HasIssue, &report.Confidence,
 		&toolsUsedStr, &skillsUsedStr, &report.Tainted, &report.Notified, &report.DiagnosedAt,
+		&structuredResult, &qualityScore, &report.CommitHash, &report.PromptVersion,
+		&report.OriginalConfidence, &report.FinalConfidence, &report.FinalConfLabel,
+		&report.Fingerprint, &report.ReusedFromID,
 	)
 	if err != nil {
 		return nil, err
@@ -536,5 +559,7 @@ func (s *MySQLStore) scanReport(row mysqlScannable) (*DiagnosisReport, error) {
 	if err := json.Unmarshal([]byte(skillsUsedStr), &report.SkillsUsed); err != nil {
 		return nil, fmt.Errorf("unmarshal skills_used: %w", err)
 	}
+	report.StructuredResult = json.RawMessage(structuredResult)
+	report.QualityScore = json.RawMessage(qualityScore)
 	return &report, nil
 }

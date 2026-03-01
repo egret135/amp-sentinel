@@ -22,7 +22,7 @@ const (
 // Task wraps an incident as a schedulable diagnosis unit.
 type Task struct {
 	ID         string
-	Incident   *intake.Incident
+	Event      *intake.RawEvent
 	Priority   int
 	Status     TaskStatus
 	RetryCount int

@@ -49,30 +49,24 @@ func NewSQLiteStore(dbPath string, log logger.Logger) (*SQLiteStore, error) {
 
 func (s *SQLiteStore) initSchema() error {
 	schema := `
-CREATE TABLE IF NOT EXISTS incidents (
+CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     project_key TEXT NOT NULL,
-    title TEXT NOT NULL,
-    error_type TEXT NOT NULL DEFAULT '',
-    error_msg TEXT NOT NULL DEFAULT '',
-    stacktrace TEXT NOT NULL DEFAULT '',
-    environment TEXT NOT NULL DEFAULT 'production',
-    severity TEXT NOT NULL DEFAULT 'warning',
-    url TEXT NOT NULL DEFAULT '',
-    metadata TEXT NOT NULL DEFAULT '{}',
+    payload TEXT NOT NULL DEFAULT '{}',
     source TEXT NOT NULL DEFAULT 'custom',
+    severity TEXT NOT NULL DEFAULT 'warning',
+    title TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
-    occurred_at DATETIME NOT NULL,
-    reported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    received_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_incidents_project_key ON incidents(project_key);
-CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status);
-CREATE INDEX IF NOT EXISTS idx_incidents_occurred_at ON incidents(occurred_at);
-CREATE INDEX IF NOT EXISTS idx_incidents_dedup ON incidents(project_key, error_msg, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_events_project_key ON events(project_key);
+CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
+CREATE INDEX IF NOT EXISTS idx_events_received_at ON events(received_at);
+CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity);
 
 CREATE TABLE IF NOT EXISTS diagnosis_tasks (
     id TEXT PRIMARY KEY,
-    incident_id TEXT NOT NULL REFERENCES incidents(id),
+    incident_id TEXT NOT NULL REFERENCES events(id),
     project_key TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     priority INTEGER NOT NULL DEFAULT 0,
@@ -104,81 +98,118 @@ CREATE TABLE IF NOT EXISTS diagnosis_reports (
     skills_used TEXT NOT NULL DEFAULT '[]',
     tainted BOOLEAN NOT NULL DEFAULT 0,
     notified BOOLEAN NOT NULL DEFAULT 0,
-    diagnosed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    diagnosed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    structured_result TEXT NOT NULL DEFAULT '',
+    quality_score TEXT NOT NULL DEFAULT '{}',
+    commit_hash TEXT NOT NULL DEFAULT '',
+    prompt_version TEXT NOT NULL DEFAULT '',
+    original_confidence REAL NOT NULL DEFAULT 0,
+    final_confidence REAL NOT NULL DEFAULT 0,
+    final_confidence_label TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT '',
+    reused_from_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_reports_task ON diagnosis_reports(task_id);
 CREATE INDEX IF NOT EXISTS idx_reports_project ON diagnosis_reports(project_key);
+CREATE INDEX IF NOT EXISTS idx_reports_fingerprint ON diagnosis_reports(project_key, fingerprint, diagnosed_at);
 `
 	_, err := s.db.Exec(schema)
+	if err != nil {
+		return err
+	}
+
+	// Migrate existing databases: add new columns to diagnosis_reports.
+	migrations := []string{
+		"ALTER TABLE diagnosis_reports ADD COLUMN structured_result TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE diagnosis_reports ADD COLUMN quality_score TEXT NOT NULL DEFAULT '{}'",
+		"ALTER TABLE diagnosis_reports ADD COLUMN commit_hash TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE diagnosis_reports ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE diagnosis_reports ADD COLUMN original_confidence REAL NOT NULL DEFAULT 0",
+		"ALTER TABLE diagnosis_reports ADD COLUMN final_confidence REAL NOT NULL DEFAULT 0",
+		"ALTER TABLE diagnosis_reports ADD COLUMN final_confidence_label TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE diagnosis_reports ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE diagnosis_reports ADD COLUMN reused_from_id TEXT NOT NULL DEFAULT ''",
+	}
+	for _, stmt := range migrations {
+		if err := s.addColumnIfNotExists(stmt); err != nil {
+			return err
+		}
+	}
+
+	// P1: fingerprint index (CREATE INDEX IF NOT EXISTS is idempotent)
+	_, _ = s.db.Exec("CREATE INDEX IF NOT EXISTS idx_reports_fingerprint ON diagnosis_reports(project_key, fingerprint, diagnosed_at)")
+
+	return nil
+}
+
+func (s *SQLiteStore) addColumnIfNotExists(alterStmt string) error {
+	_, err := s.db.Exec(alterStmt)
+	if err != nil && strings.Contains(err.Error(), "duplicate column") {
+		return nil
+	}
 	return err
 }
 
-func (s *SQLiteStore) CreateIncident(ctx context.Context, inc *Incident) error {
-	md := inc.Metadata
-	if md == nil {
-		md = map[string]string{}
-	}
-	metadata, err := json.Marshal(md)
-	if err != nil {
-		return fmt.Errorf("marshal metadata: %w", err)
+func (s *SQLiteStore) CreateEvent(ctx context.Context, event *Event) error {
+	payload := event.Payload
+	if payload == nil {
+		payload = json.RawMessage("{}")
 	}
 
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO incidents (id, project_key, title, error_type, error_msg, stacktrace, environment, severity, url, metadata, source, status, occurred_at, reported_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		inc.ID, inc.ProjectKey, inc.Title, inc.ErrorType, inc.ErrorMsg, inc.Stacktrace,
-		inc.Environment, inc.Severity, inc.URL, string(metadata), inc.Source, inc.Status,
-		inc.OccurredAt, inc.ReportedAt,
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO events (id, project_key, payload, source, severity, title, status, received_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ID, event.ProjectKey, string(payload), event.Source, event.Severity,
+		event.Title, event.Status, event.ReceivedAt,
 	)
 	if err != nil {
-		return fmt.Errorf("insert incident: %w", err)
+		return fmt.Errorf("insert event: %w", err)
 	}
 	return nil
 }
 
-func (s *SQLiteStore) GetIncident(ctx context.Context, id string) (*Incident, error) {
+func (s *SQLiteStore) GetEvent(ctx context.Context, id string) (*Event, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, project_key, title, error_type, error_msg, stacktrace, environment, severity, url, metadata, source, status, occurred_at, reported_at
-		 FROM incidents WHERE id = ?`, id)
+		`SELECT id, project_key, payload, source, severity, title, status, received_at
+		 FROM events WHERE id = ?`, id)
 
-	inc, err := s.scanIncident(row)
+	event, err := s.scanEvent(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return inc, err
+	return event, err
 }
 
-func (s *SQLiteStore) UpdateIncident(ctx context.Context, inc *Incident) error {
-	md := inc.Metadata
-	if md == nil {
-		md = map[string]string{}
-	}
-	metadata, err := json.Marshal(md)
-	if err != nil {
-		return fmt.Errorf("marshal metadata: %w", err)
+func (s *SQLiteStore) UpdateEvent(ctx context.Context, event *Event) error {
+	payload := event.Payload
+	if payload == nil {
+		payload = json.RawMessage("{}")
 	}
 
-	_, err = s.db.ExecContext(ctx,
-		`UPDATE incidents SET project_key=?, title=?, error_type=?, error_msg=?, stacktrace=?, environment=?, severity=?, url=?, metadata=?, source=?, status=?, occurred_at=?, reported_at=?
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE events SET project_key=?, payload=?, source=?, severity=?, title=?, status=?, received_at=?
 		 WHERE id=?`,
-		inc.ProjectKey, inc.Title, inc.ErrorType, inc.ErrorMsg, inc.Stacktrace,
-		inc.Environment, inc.Severity, inc.URL, string(metadata), inc.Source, inc.Status,
-		inc.OccurredAt, inc.ReportedAt, inc.ID,
+		event.ProjectKey, string(payload), event.Source, event.Severity,
+		event.Title, event.Status, event.ReceivedAt, event.ID,
 	)
 	if err != nil {
-		return fmt.Errorf("update incident: %w", err)
+		return fmt.Errorf("update event: %w", err)
 	}
 	return nil
 }
 
-func (s *SQLiteStore) ListIncidents(ctx context.Context, filter IncidentFilter) ([]*Incident, error) {
-	query := "SELECT id, project_key, title, error_type, error_msg, stacktrace, environment, severity, url, metadata, source, status, occurred_at, reported_at FROM incidents"
+func (s *SQLiteStore) ListEvents(ctx context.Context, filter EventFilter) ([]*Event, error) {
+	query := "SELECT id, project_key, payload, source, severity, title, status, received_at FROM events"
 	var conditions []string
 	var args []any
 
 	if filter.ProjectKey != "" {
 		conditions = append(conditions, "project_key = ?")
 		args = append(args, filter.ProjectKey)
+	}
+	if filter.Source != "" {
+		conditions = append(conditions, "source = ?")
+		args = append(args, filter.Source)
 	}
 	if filter.Status != "" {
 		conditions = append(conditions, "status = ?")
@@ -193,7 +224,7 @@ func (s *SQLiteStore) ListIncidents(ctx context.Context, filter IncidentFilter) 
 		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
 
-	query += " ORDER BY occurred_at DESC"
+	query += " ORDER BY received_at DESC"
 
 	limit := filter.Limit
 	if limit <= 0 {
@@ -207,19 +238,19 @@ func (s *SQLiteStore) ListIncidents(ctx context.Context, filter IncidentFilter) 
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list incidents: %w", err)
+		return nil, fmt.Errorf("list events: %w", err)
 	}
 	defer rows.Close()
 
-	var incidents []*Incident
+	var events []*Event
 	for rows.Next() {
-		inc, err := s.scanIncidentRow(rows)
+		event, err := s.scanEvent(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan incident: %w", err)
+			return nil, fmt.Errorf("scan event: %w", err)
 		}
-		incidents = append(incidents, inc)
+		events = append(events, event)
 	}
-	return incidents, rows.Err()
+	return events, rows.Err()
 }
 
 func (s *SQLiteStore) CreateTask(ctx context.Context, task *DiagnosisTask) error {
@@ -234,7 +265,7 @@ func (s *SQLiteStore) CreateTask(ctx context.Context, task *DiagnosisTask) error
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO diagnosis_tasks (id, incident_id, project_key, status, priority, session_id, num_turns, duration_ms, input_tokens, output_tokens, error, retry_count, created_at, started_at, finished_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		task.ID, task.IncidentID, task.ProjectKey, string(task.Status), task.Priority,
+		task.ID, task.EventID, task.ProjectKey, string(task.Status), task.Priority,
 		task.SessionID, task.NumTurns, task.DurationMs, task.InputTokens, task.OutputTokens,
 		task.Error, task.RetryCount, task.CreatedAt, startedAt, finishedAt,
 	)
@@ -268,7 +299,7 @@ func (s *SQLiteStore) UpdateTask(ctx context.Context, task *DiagnosisTask) error
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE diagnosis_tasks SET incident_id=?, project_key=?, status=?, priority=?, session_id=?, num_turns=?, duration_ms=?, input_tokens=?, output_tokens=?, error=?, retry_count=?, created_at=?, started_at=?, finished_at=?
 		 WHERE id=?`,
-		task.IncidentID, task.ProjectKey, string(task.Status), task.Priority,
+		task.EventID, task.ProjectKey, string(task.Status), task.Priority,
 		task.SessionID, task.NumTurns, task.DurationMs, task.InputTokens, task.OutputTokens,
 		task.Error, task.RetryCount, task.CreatedAt, startedAt, finishedAt, task.ID,
 	)
@@ -283,9 +314,9 @@ func (s *SQLiteStore) ListTasks(ctx context.Context, filter TaskFilter) ([]*Diag
 	var conditions []string
 	var args []any
 
-	if filter.IncidentID != "" {
+	if filter.EventID != "" {
 		conditions = append(conditions, "incident_id = ?")
-		args = append(args, filter.IncidentID)
+		args = append(args, filter.EventID)
 	}
 	if filter.ProjectKey != "" {
 		conditions = append(conditions, "project_key = ?")
@@ -320,7 +351,7 @@ func (s *SQLiteStore) ListTasks(ctx context.Context, filter TaskFilter) ([]*Diag
 
 	var tasks []*DiagnosisTask
 	for rows.Next() {
-		task, err := s.scanTaskRow(rows)
+		task, err := s.scanTask(rows)
 		if err != nil {
 			return nil, fmt.Errorf("scan task: %w", err)
 		}
@@ -366,12 +397,24 @@ func (s *SQLiteStore) SaveReport(ctx context.Context, report *DiagnosisReport) e
 		return fmt.Errorf("marshal skills_used: %w", err)
 	}
 
+	structuredResult := string(report.StructuredResult)
+	if report.StructuredResult == nil || len(report.StructuredResult) == 0 {
+		structuredResult = "null"
+	}
+	qualityScore := string(report.QualityScore)
+	if report.QualityScore == nil || len(report.QualityScore) == 0 {
+		qualityScore = "{}"
+	}
+
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO diagnosis_reports (id, task_id, incident_id, project_key, project_name, summary, raw_result, has_issue, confidence, tools_used, skills_used, tainted, notified, diagnosed_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		report.ID, report.TaskID, report.IncidentID, report.ProjectKey, report.ProjectName,
+		`INSERT INTO diagnosis_reports (id, task_id, incident_id, project_key, project_name, summary, raw_result, has_issue, confidence, tools_used, skills_used, tainted, notified, diagnosed_at, structured_result, quality_score, commit_hash, prompt_version, original_confidence, final_confidence, final_confidence_label, fingerprint, reused_from_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		report.ID, report.TaskID, report.EventID, report.ProjectKey, report.ProjectName,
 		report.Summary, report.RawResult, report.HasIssue, report.Confidence,
 		string(toolsUsed), string(skillsUsed), report.Tainted, report.Notified, report.DiagnosedAt,
+		structuredResult, qualityScore, report.CommitHash, report.PromptVersion,
+		report.OriginalConfidence, report.FinalConfidence, report.FinalConfLabel,
+		report.Fingerprint, report.ReusedFromID,
 	)
 	if err != nil {
 		return fmt.Errorf("insert report: %w", err)
@@ -381,7 +424,7 @@ func (s *SQLiteStore) SaveReport(ctx context.Context, report *DiagnosisReport) e
 
 func (s *SQLiteStore) GetReport(ctx context.Context, taskID string) (*DiagnosisReport, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, task_id, incident_id, project_key, project_name, summary, raw_result, has_issue, confidence, tools_used, skills_used, tainted, notified, diagnosed_at
+		`SELECT id, task_id, incident_id, project_key, project_name, summary, raw_result, has_issue, confidence, tools_used, skills_used, tainted, notified, diagnosed_at, structured_result, quality_score, commit_hash, prompt_version, original_confidence, final_confidence, final_confidence_label, fingerprint, reused_from_id
 		 FROM diagnosis_reports WHERE task_id = ?`, taskID)
 
 	report, err := s.scanReport(row)
@@ -391,18 +434,18 @@ func (s *SQLiteStore) GetReport(ctx context.Context, taskID string) (*DiagnosisR
 	return report, err
 }
 
-func (s *SQLiteStore) FindRecentIncident(ctx context.Context, projectKey, errorMsg string, window time.Duration) (*Incident, error) {
-	cutoff := time.Now().Add(-window)
+func (s *SQLiteStore) FindRecentReportByFingerprint(ctx context.Context, projectKey, fingerprint string, since time.Time) (*DiagnosisReport, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, project_key, title, error_type, error_msg, stacktrace, environment, severity, url, metadata, source, status, occurred_at, reported_at
-		 FROM incidents WHERE project_key = ? AND error_msg = ? AND occurred_at > ? ORDER BY occurred_at DESC LIMIT 1`,
-		projectKey, errorMsg, cutoff)
+		`SELECT id, task_id, incident_id, project_key, project_name, summary, raw_result, has_issue, confidence, tools_used, skills_used, tainted, notified, diagnosed_at, structured_result, quality_score, commit_hash, prompt_version, original_confidence, final_confidence, final_confidence_label, fingerprint, reused_from_id
+		 FROM diagnosis_reports
+		 WHERE project_key = ? AND fingerprint = ? AND diagnosed_at > ? AND reused_from_id = ''
+		 ORDER BY diagnosed_at DESC LIMIT 1`, projectKey, fingerprint, since)
 
-	inc, err := s.scanIncident(row)
+	report, err := s.scanReport(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return inc, err
+	return report, err
 }
 
 func (s *SQLiteStore) GetUsageSummary(ctx context.Context) (*UsageSummary, error) {
@@ -410,14 +453,14 @@ func (s *SQLiteStore) GetUsageSummary(ctx context.Context) (*UsageSummary, error
 		TasksByStatus: make(map[TaskStatus]int),
 	}
 
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM incidents").Scan(&summary.TotalIncidents)
+	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM events").Scan(&summary.TotalEvents)
 	if err != nil {
-		return nil, fmt.Errorf("count incidents: %w", err)
+		return nil, fmt.Errorf("count events: %w", err)
 	}
 
-	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM incidents WHERE DATE(reported_at) = DATE('now')").Scan(&summary.TodayIncidents)
+	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE DATE(received_at) = DATE('now')").Scan(&summary.TodayEvents)
 	if err != nil {
-		return nil, fmt.Errorf("count today incidents: %w", err)
+		return nil, fmt.Errorf("count today events: %w", err)
 	}
 
 	statusCounts, err := s.CountByStatus(ctx)
@@ -448,25 +491,18 @@ type scannable interface {
 	Scan(dest ...any) error
 }
 
-func (s *SQLiteStore) scanIncident(row scannable) (*Incident, error) {
-	var inc Incident
-	var metadataStr string
+func (s *SQLiteStore) scanEvent(row scannable) (*Event, error) {
+	var event Event
+	var payloadStr string
 	err := row.Scan(
-		&inc.ID, &inc.ProjectKey, &inc.Title, &inc.ErrorType, &inc.ErrorMsg, &inc.Stacktrace,
-		&inc.Environment, &inc.Severity, &inc.URL, &metadataStr, &inc.Source, &inc.Status,
-		&inc.OccurredAt, &inc.ReportedAt,
+		&event.ID, &event.ProjectKey, &payloadStr, &event.Source,
+		&event.Severity, &event.Title, &event.Status, &event.ReceivedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal([]byte(metadataStr), &inc.Metadata); err != nil {
-		return nil, fmt.Errorf("unmarshal metadata: %w", err)
-	}
-	return &inc, nil
-}
-
-func (s *SQLiteStore) scanIncidentRow(rows *sql.Rows) (*Incident, error) {
-	return s.scanIncident(rows)
+	event.Payload = json.RawMessage(payloadStr)
+	return &event, nil
 }
 
 func (s *SQLiteStore) scanTask(row scannable) (*DiagnosisTask, error) {
@@ -474,7 +510,7 @@ func (s *SQLiteStore) scanTask(row scannable) (*DiagnosisTask, error) {
 	var status string
 	var startedAt, finishedAt sql.NullTime
 	err := row.Scan(
-		&task.ID, &task.IncidentID, &task.ProjectKey, &status, &task.Priority,
+		&task.ID, &task.EventID, &task.ProjectKey, &status, &task.Priority,
 		&task.SessionID, &task.NumTurns, &task.DurationMs, &task.InputTokens, &task.OutputTokens,
 		&task.Error, &task.RetryCount, &task.CreatedAt, &startedAt, &finishedAt,
 	)
@@ -491,17 +527,17 @@ func (s *SQLiteStore) scanTask(row scannable) (*DiagnosisTask, error) {
 	return &task, nil
 }
 
-func (s *SQLiteStore) scanTaskRow(rows *sql.Rows) (*DiagnosisTask, error) {
-	return s.scanTask(rows)
-}
-
 func (s *SQLiteStore) scanReport(row scannable) (*DiagnosisReport, error) {
 	var report DiagnosisReport
 	var toolsUsedStr, skillsUsedStr string
+	var structuredResultStr, qualityScoreStr string
 	err := row.Scan(
-		&report.ID, &report.TaskID, &report.IncidentID, &report.ProjectKey, &report.ProjectName,
+		&report.ID, &report.TaskID, &report.EventID, &report.ProjectKey, &report.ProjectName,
 		&report.Summary, &report.RawResult, &report.HasIssue, &report.Confidence,
 		&toolsUsedStr, &skillsUsedStr, &report.Tainted, &report.Notified, &report.DiagnosedAt,
+		&structuredResultStr, &qualityScoreStr, &report.CommitHash, &report.PromptVersion,
+		&report.OriginalConfidence, &report.FinalConfidence, &report.FinalConfLabel,
+		&report.Fingerprint, &report.ReusedFromID,
 	)
 	if err != nil {
 		return nil, err
@@ -511,6 +547,12 @@ func (s *SQLiteStore) scanReport(row scannable) (*DiagnosisReport, error) {
 	}
 	if err := json.Unmarshal([]byte(skillsUsedStr), &report.SkillsUsed); err != nil {
 		return nil, fmt.Errorf("unmarshal skills_used: %w", err)
+	}
+	if structuredResultStr != "" {
+		report.StructuredResult = json.RawMessage(structuredResultStr)
+	}
+	if qualityScoreStr != "" {
+		report.QualityScore = json.RawMessage(qualityScoreStr)
 	}
 	return &report, nil
 }
